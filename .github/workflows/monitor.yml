@@ -1,0 +1,46 @@
+name: Flight Price Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установка зависимостей
+        run: pip install requests
+
+      # Восстанавливаем цены и список подписчиков между запусками
+      - name: Восстановить кэш
+        uses: actions/cache@v4
+        with:
+          path: |
+            prices.json
+            subscribers.json
+            tg_offset.json
+          key: flight-monitor-cache
+          restore-keys: flight-monitor-cache
+
+      - name: Запуск проверки
+        run: python check_prices.py
+
+      # Сохраняем обновлённые данные обратно
+      - name: Сохранить кэш
+        uses: actions/cache@v4
+        with:
+          path: |
+            prices.json
+            subscribers.json
+            tg_offset.json
+          key: flight-monitor-cache
