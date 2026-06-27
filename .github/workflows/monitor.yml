@@ -21,7 +21,6 @@ jobs:
       - name: Установка зависимостей
         run: pip install requests
 
-      # Восстанавливаем цены и список подписчиков между запусками
       - name: Восстановить кэш
         uses: actions/cache@v4
         with:
@@ -33,9 +32,12 @@ jobs:
           restore-keys: flight-monitor-cache
 
       - name: Запуск проверки
+        env:
+          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python check_prices.py
 
-      # Сохраняем обновлённые данные обратно
       - name: Сохранить кэш
         uses: actions/cache@v4
         with:
