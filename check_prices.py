@@ -1,3 +1,4 @@
+import os
 import json
 import requests
 from datetime import datetime
@@ -5,10 +6,10 @@ from itertools import product
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
 
-TRAVELPAYOUTS_TOKEN  = "74992fc51a9f3abeee3b491e648eb0b5"
-TELEGRAM_BOT_TOKEN   = "8855541806:AAExdMGNuD593bf_BM59Nd8PWekx5inMx6o"
+TRAVELPAYOUTS_TOKEN  = os.environ["TRAVELPAYOUTS_TOKEN"]
+TELEGRAM_BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
 
-OWNER_CHAT_ID        = "251809170"
+OWNER_CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
 
 DEFAULT_OUTBOUND_FROM = "2026-07-17"
 DEFAULT_OUTBOUND_TO   = "2026-07-20"
