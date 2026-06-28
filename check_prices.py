@@ -232,6 +232,9 @@ def get_all_prices_graphql(out_from: str, out_to: str, ret_from: str, ret_to: st
     Один GraphQL-запрос для всего диапазона дат подписчика.
     Возвращает dict: {"out_date_ret_date": {airline_code: price}}
     """
+    # depart_months принимает первое число месяца: "2026-07-01"
+    month_start = out_from[:7] + "-01"
+
     query = """
     {
       prices_round_trip(
@@ -249,7 +252,7 @@ def get_all_prices_graphql(out_from: str, out_to: str, ret_from: str, ret_to: st
         ticket_link
       }
     }
-    """ % (ORIGIN, DESTINATION, out_from)
+    """ % (ORIGIN, DESTINATION, month_start)
 
     headers = {
         "Content-Type":   "application/json",
