@@ -229,85 +229,82 @@ def send_message(chat_id: str, text: str):
 
 def get_all_prices_graphql(out_from: str, out_to: str, ret_from: str, ret_to: str) -> dict:
     """
-    Один GraphQL-запрос для всего диапазона дат подписчика.
+    Запрашивает prices_round_trip через GraphQL.
+    Делает один запрос на каждую дату возврата, фильтрует по дате вылета в коде.
     Возвращает dict: {"out_date_ret_date": {airline_code: price}}
     """
-    # depart_months принимает первое число месяца: "2026-07-01"
+    from datetime import timedelta
     month_start = out_from[:7] + "-01"
-
-    query = """
-    {
-      prices_round_trip(
-        params: {
-          origin: "%s"
-          destination: "%s"
-          depart_months: "%s"
-        }
-        paging: { limit: 50 offset: 0 }
-        sorting: VALUE_ASC
-      ) {
-        departure_at
-        return_at
-        value
-        ticket_link
-      }
-    }
-    """ % (ORIGIN, DESTINATION, month_start)
 
     headers = {
         "Content-Type":   "application/json",
         "X-Access-Token": TRAVELPAYOUTS_TOKEN,
     }
 
-    try:
-        resp = requests.post(
-            GRAPHQL_URL,
-            json={"query": query},
-            headers=headers,
-            timeout=15
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    result = {}
 
-        tickets = data.get("data", {}).get("prices_round_trip", []) or []
-        print(f"  [DEBUG] API вернул {len(tickets)} билетов")
-        if tickets:
-            # Показываем первые 3 для диагностики
-            for t in tickets[:3]:
-                dep = t.get("departure_at", "")[:10]
-                ret = t.get("return_at", "")[:10]
-                val = t.get("value", 0)
-                print(f"  [DEBUG] dep={dep} ret={ret} val={val}")
-        if not tickets:
-            return {}
+    # Перебираем даты возврата
+    ret_start = datetime.strptime(ret_from, "%Y-%m-%d").date()
+    ret_end   = datetime.strptime(ret_to,   "%Y-%m-%d").date()
+    ret_days  = (ret_end - ret_start).days + 1
 
-        result = {}
-        for ticket in tickets:
-            dep     = ticket.get("departure_at", "")[:10]
-            ret     = ticket.get("return_at", "")[:10]
-            price   = ticket.get("value", 0)
-            link    = ticket.get("ticket_link", "")
-            airline = extract_airline(link)
+    for i in range(ret_days):
+        ret_date = (ret_start + timedelta(days=i)).strftime("%Y-%m-%d")
 
-            # Фильтруем по нужным диапазонам дат
-            if not (out_from <= dep <= out_to):
-                continue
-            if not (ret_from <= ret <= ret_to):
-                continue
-            if not airline or not price:
-                continue
+        query = """
+        {
+          prices_round_trip(
+            params: {
+              origin: "%s"
+              destination: "%s"
+              depart_months: "%s"
+              return_dates: "%s"
+            }
+            paging: { limit: 50 offset: 0 }
+            sorting: VALUE_ASC
+          ) {
+            departure_at
+            return_at
+            value
+            ticket_link
+          }
+        }
+        """ % (ORIGIN, DESTINATION, month_start, ret_date)
 
-            key = f"{dep}_{ret}"
-            if key not in result:
-                result[key] = {}
-            if airline not in result[key] or price < result[key][airline]:
-                result[key][airline] = price
+        try:
+            resp = requests.post(
+                GRAPHQL_URL,
+                json={"query": query},
+                headers=headers,
+                timeout=15
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            tickets = data.get("data", {}).get("prices_round_trip", []) or []
 
-        return result
+            for ticket in tickets:
+                dep     = ticket.get("departure_at", "")[:10]
+                ret     = ticket.get("return_at", "")[:10]
+                price   = ticket.get("value", 0)
+                link    = ticket.get("ticket_link", "")
+                airline = extract_airline(link)
 
-    except Exception as e:
-        print(f"  [ОШИБКА] GraphQL: {e}")
-        return {}
+                # Фильтруем по диапазону дат вылета
+                if not (out_from <= dep <= out_to):
+                    continue
+                if not airline or not price:
+                    continue
+
+                key = f"{dep}_{ret}"
+                if key not in result:
+                    result[key] = {}
+                if airline not in result[key] or price < result[key][airline]:
+                    result[key][airline] = price
+
+        except Exception as e:
+            print(f"  [ОШИБКА] GraphQL ret={ret_date}: {e}")
+
+    return result
 
 
 # ─── Хранилище цен ────────────────────────────────────────────────────────────
