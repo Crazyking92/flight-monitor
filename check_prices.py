@@ -94,28 +94,39 @@ def save_subscribers(subscribers: dict):
 
 def check_new_messages(subscribers: dict) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    try:
-        with open(OFFSET_FILE, "r") as f:
-            offset = json.load(f).get("offset", 0)
-    except (FileNotFoundError, json.JSONDecodeError):
-        offset = 0
 
     try:
-        resp = requests.get(url, params={"offset": offset, "timeout": 5}, timeout=10)
+        resp = requests.get(url, params={"timeout": 5}, timeout=10)
         resp.raise_for_status()
         updates = resp.json().get("result", [])
     except Exception as e:
         print(f"  [ОШИБКА] getUpdates: {e}")
         return subscribers
 
-    max_update_id = offset
+    # Игнорируем сообщения старше 10 минут
+    now = datetime.utcnow().timestamp()
+    MAX_AGE_SECONDS = 600
+
+    # Собираем все update_id чтобы пометить как прочитанные
+    all_update_ids = [u["update_id"] for u in updates]
+    if all_update_ids:
+        max_update_id = max(all_update_ids) + 1
+        try:
+            requests.get(url, params={"offset": max_update_id, "timeout": 1}, timeout=5)
+        except Exception:
+            pass
 
     for update in updates:
-        max_update_id = max(max_update_id, update["update_id"] + 1)
         message = update.get("message", {})
         text    = message.get("text", "").strip()
         chat_id = str(message.get("chat", {}).get("id", ""))
         name    = message.get("chat", {}).get("first_name", "Пользователь")
+        msg_time = message.get("date", 0)
+
+        # Пропускаем старые сообщения
+        if now - msg_time > MAX_AGE_SECONDS:
+            print(f"  [ПРОПУСК] Старое сообщение от {name}: «{text[:30]}»")
+            continue
 
         if not chat_id or not text:
             continue
@@ -180,9 +191,6 @@ def check_new_messages(subscribers: dict) -> dict:
                 )
             else:
                 send_message(chat_id, "❌ Ты не подписан. Напиши /start чтобы подписаться.")
-
-    with open(OFFSET_FILE, "w") as f:
-        json.dump({"offset": max_update_id}, f)
 
     return subscribers
 
