@@ -27,7 +27,6 @@ jobs:
           path: |
             prices.json
             subscribers.json
-            tg_offset.json
           key: flight-monitor-cache
           restore-keys: flight-monitor-cache
 
@@ -44,5 +43,4 @@ jobs:
           path: |
             prices.json
             subscribers.json
-            tg_offset.json
           key: flight-monitor-cache
