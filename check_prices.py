@@ -1,14 +1,13 @@
 import os
 import json
+import re
 import requests
-from datetime import datetime
-from itertools import product
+from datetime import datetime, timedelta
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
 
 TRAVELPAYOUTS_TOKEN  = os.environ["TRAVELPAYOUTS_TOKEN"]
 TELEGRAM_BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-
 OWNER_CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
 
 DEFAULT_OUTBOUND_FROM = "2026-07-17"
@@ -22,12 +21,29 @@ ORIGIN         = "MOW"
 DESTINATION    = "EVN"
 PRICES_FILE    = "prices.json"
 SUBSCRIBERS_FILE = "subscribers.json"
-OFFSET_FILE    = "tg_offset.json"
+
+GRAPHQL_URL = "https://api.travelpayouts.com/graphql/v1/query"
+
+# Расшифровка IATA-кодов АК
+AIRLINE_NAMES = {
+    "SU": "Аэрофлот",
+    "3F": "Nordwind Airlines",
+    "UT": "UTair",
+    "S7": "S7 Airlines",
+    "U6": "Уральские авиалинии",
+    "FV": "Россия",
+    "DP": "Pobeda",
+    "5N": "Smartavia",
+    "N4": "Nordwind Airlines",
+}
+
+def airline_name(code: str) -> str:
+    return AIRLINE_NAMES.get(code, code)
+
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
 
 def date_range(date_from: str, date_to: str) -> list:
-    from datetime import timedelta
     start = datetime.strptime(date_from, "%Y-%m-%d").date()
     end   = datetime.strptime(date_to,   "%Y-%m-%d").date()
     days  = (end - start).days
@@ -36,11 +52,17 @@ def date_range(date_from: str, date_to: str) -> list:
     return [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days + 1)]
 
 
+def extract_airline(ticket_link: str) -> str:
+    """Извлекает IATA-код АК из ticket_link. Код — первые 2 символа после t="""
+    match = re.search(r"[?&]t=([A-Z0-9]{2})", ticket_link)
+    if match:
+        return match.group(1)
+    # Альтернативный паттерн — из пути /MOW1707EVN1?t=3F...
+    match = re.search(r"t=([A-Z0-9]{2})\d", ticket_link)
+    return match.group(1) if match else "??"
+
+
 def parse_start_command(text: str):
-    """
-    Парсит /start ДД.ММ-ДД.ММ ДД.ММ-ДД.ММ
-    Возвращает (out_from, out_to, ret_from, ret_to) или None.
-    """
     parts = text.strip().split()
     if len(parts) != 3:
         return None
@@ -62,7 +84,6 @@ def parse_start_command(text: str):
 
         if out_from > out_to or ret_from > ret_to:
             return None
-
         return out_from, out_to, ret_from, ret_to
     except (ValueError, AttributeError):
         return None
@@ -94,6 +115,8 @@ def save_subscribers(subscribers: dict):
 
 def check_new_messages(subscribers: dict) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    now = datetime.utcnow().timestamp()
+    MAX_AGE = 600  # 10 минут
 
     try:
         resp = requests.get(url, params={"timeout": 5}, timeout=10)
@@ -103,32 +126,24 @@ def check_new_messages(subscribers: dict) -> dict:
         print(f"  [ОШИБКА] getUpdates: {e}")
         return subscribers
 
-    # Игнорируем сообщения старше 10 минут
-    now = datetime.utcnow().timestamp()
-    MAX_AGE_SECONDS = 600
-
-    # Собираем все update_id чтобы пометить как прочитанные
-    all_update_ids = [u["update_id"] for u in updates]
-    if all_update_ids:
-        max_update_id = max(all_update_ids) + 1
+    all_ids = [u["update_id"] for u in updates]
+    if all_ids:
         try:
-            requests.get(url, params={"offset": max_update_id, "timeout": 1}, timeout=5)
+            requests.get(url, params={"offset": max(all_ids) + 1, "timeout": 1}, timeout=5)
         except Exception:
             pass
 
     for update in updates:
-        message = update.get("message", {})
-        text    = message.get("text", "").strip()
-        chat_id = str(message.get("chat", {}).get("id", ""))
-        name    = message.get("chat", {}).get("first_name", "Пользователь")
+        message  = update.get("message", {})
+        text     = message.get("text", "").strip()
+        chat_id  = str(message.get("chat", {}).get("id", ""))
+        name     = message.get("chat", {}).get("first_name", "Пользователь")
         msg_time = message.get("date", 0)
 
-        # Пропускаем старые сообщения
-        if now - msg_time > MAX_AGE_SECONDS:
-            print(f"  [ПРОПУСК] Старое сообщение от {name}: «{text[:30]}»")
-            continue
-
         if not chat_id or not text:
+            continue
+        if now - msg_time > MAX_AGE:
+            print(f"  [ПРОПУСК] Старое сообщение от {name}: «{text[:30]}»")
             continue
 
         if text.startswith("/start"):
@@ -210,42 +225,64 @@ def send_message(chat_id: str, text: str):
         print(f"  [ОШИБКА] Telegram → {chat_id}: {e}")
 
 
-# ─── Цены (новый эндпоинт: все АК по направлению) ─────────────────────────────
+# ─── GraphQL запрос цен ───────────────────────────────────────────────────────
 
-def get_prices_all_airlines(depart_date: str, return_date: str) -> dict:
+def get_prices_graphql(depart_date: str, return_date: str) -> dict:
     """
-    Запрашивает /v1/prices/cheap — возвращает минимальные цены по авиакомпаниям.
+    Запрашивает prices_round_trip через GraphQL.
     Возвращает dict: {airline_code: price}
     """
-    url = "https://api.travelpayouts.com/v1/prices/cheap"
-    params = {
-        "origin":             ORIGIN,
-        "destination":        DESTINATION,
-        "depart_date":        depart_date,
-        "return_date":        return_date,
-        "token":              TRAVELPAYOUTS_TOKEN,
-        "currency":           "rub",
-        "page":               1,
-        "limit":              30,
-        "show_to_affiliates": "false",
+    query = """
+    {
+      prices_round_trip(
+        params: {
+          origin: "%s"
+          destination: "%s"
+          depart_months: "%s"
+          return_dates: "%s"
+        }
+        paging: { limit: 50 offset: 0 }
+        sorting: VALUE_ASC
+      ) {
+        departure_at
+        return_at
+        value
+        ticket_link
+      }
     }
+    """ % (ORIGIN, DESTINATION, depart_date, return_date)
+
+    headers = {
+        "Content-Type":  "application/json",
+        "X-Access-Token": TRAVELPAYOUTS_TOKEN,
+    }
+
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.post(
+            GRAPHQL_URL,
+            json={"query": query},
+            headers=headers,
+            timeout=15
+        )
         resp.raise_for_status()
         data = resp.json()
 
-        if not data.get("success") or not data.get("data"):
+        tickets = data.get("data", {}).get("prices_round_trip", []) or []
+        if not tickets:
             return {}
 
-        dest_data = data["data"].get(DESTINATION, {})
-        if not dest_data:
-            return {}
-
-        # Группируем по авиакомпании, берём минимальную цену
         result = {}
-        for ticket in dest_data.values():
-            airline = ticket.get("airline", "")
-            price   = ticket.get("price", 0)
+        for ticket in tickets:
+            # Фильтруем только по нужной дате вылета
+            dep = ticket.get("departure_at", "")[:10]
+            ret = ticket.get("return_at", "")[:10]
+            if dep != depart_date or ret != return_date:
+                continue
+
+            price      = ticket.get("value", 0)
+            link       = ticket.get("ticket_link", "")
+            airline    = extract_airline(link)
+
             if airline and price:
                 if airline not in result or price < result[airline]:
                     result[airline] = price
@@ -253,7 +290,7 @@ def get_prices_all_airlines(depart_date: str, return_date: str) -> dict:
         return result
 
     except Exception as e:
-        print(f"  [ОШИБКА] {depart_date}/{return_date}: {e}")
+        print(f"  [ОШИБКА] GraphQL {depart_date}/{return_date}: {e}")
         return {}
 
 
@@ -274,32 +311,12 @@ def save_prices(prices: dict):
 
 # ─── Форматирование алерта ────────────────────────────────────────────────────
 
-# Расшифровка популярных IATA-кодов АК на этом направлении
-AIRLINE_NAMES = {
-    "SU": "Аэрофлот",
-    "3F": "Nordwind Airlines",
-    "UT": "UTair",
-    "S7": "S7 Airlines",
-    "U6": "Уральские авиалинии",
-    "FV": "Россия",
-    "DP": "Pobeda",
-    "5N": "Smartavia",
-    "GY": "Colorful Guizhou Airlines",
-    "R3": "Якутия",
-}
-
-def airline_name(code: str) -> str:
-    return AIRLINE_NAMES.get(code, code)
-
-
 def format_alert(depart_date: str, return_date: str, drops: list) -> str:
-    """
-    drops — список dict: {airline, old_price, new_price}
-    """
     link_date = depart_date.replace("-", "")
     header = (
-        f"✈️ <b>Снижение цен: {depart_date} → {return_date}</b>\n"
-        f"🛫 Москва → Ереван → Москва\n\n"
+        f"✈️ <b>Снижение цен!</b>\n"
+        f"🛫 Москва → Ереван → Москва\n"
+        f"📅 Туда: <b>{depart_date}</b> | Обратно: <b>{return_date}</b>\n\n"
     )
     lines = []
     for d in sorted(drops, key=lambda x: x["new_price"]):
@@ -328,12 +345,11 @@ def main():
     save_subscribers(subscribers)
     print(f"Подписчиков: {len(subscribers)}")
 
-    # 2. Собираем уникальные пары дат по всем подписчикам
+    # 2. Собираем уникальные пары дат
     previous = load_previous_prices()
     current  = {}
-
-    # {ключ пары дат: список chat_id которым нужна эта пара}
     pairs_to_subs: dict[str, list] = {}
+
     for chat_id, s in subscribers.items():
         for out_date in date_range(s["out_from"], s["out_to"]):
             for ret_date in date_range(s["ret_from"], s["ret_to"]):
@@ -342,24 +358,24 @@ def main():
 
     print(f"Уникальных пар дат: {len(pairs_to_subs)}")
 
-    # {chat_id: [алерты]}
     subscriber_alerts: dict[str, list] = {cid: [] for cid in subscribers}
 
     for key, sub_ids in pairs_to_subs.items():
         out_date, ret_date = key.split("_")
-        prices_by_airline = get_prices_all_airlines(out_date, ret_date)
+        prices_by_airline = get_prices_graphql(out_date, ret_date)
 
         if not prices_by_airline:
             print(f"  {key}: нет данных")
             continue
 
-        # Сохраняем текущие цены
         current[key] = prices_by_airline
         cheapest = min(prices_by_airline.values())
-        airlines_str = ", ".join(f"{airline_name(k)}={v:,}₽" for k, v in sorted(prices_by_airline.items(), key=lambda x: x[1]))
+        airlines_str = ", ".join(
+            f"{airline_name(k)}={v:,}₽"
+            for k, v in sorted(prices_by_airline.items(), key=lambda x: x[1])
+        )
         print(f"  {key}: мин={cheapest:,}₽  [{airlines_str}]")
 
-        # Сравниваем с предыдущими ценами по каждой АК
         prev_prices = previous.get(key, {})
         drops = []
         for airline, new_price in prices_by_airline.items():
@@ -388,9 +404,7 @@ def main():
     if not any(subscriber_alerts.values()):
         print("Снижений не обнаружено.")
 
-    # 4. Сохраняем цены (объединяем старые и новые)
-    merged = {**previous, **current}
-    save_prices(merged)
+    save_prices({**previous, **current})
     print("Готово.")
 
 
