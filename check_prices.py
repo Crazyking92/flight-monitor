@@ -227,10 +227,10 @@ def send_message(chat_id: str, text: str):
 
 # ─── GraphQL запрос цен ───────────────────────────────────────────────────────
 
-def get_prices_graphql(depart_date: str, return_date: str) -> dict:
+def get_all_prices_graphql(out_from: str, out_to: str, ret_from: str, ret_to: str) -> dict:
     """
-    Запрашивает prices_round_trip через GraphQL.
-    Возвращает dict: {airline_code: price}
+    Один GraphQL-запрос для всего диапазона дат подписчика.
+    Возвращает dict: {"out_date_ret_date": {airline_code: price}}
     """
     query = """
     {
@@ -239,7 +239,6 @@ def get_prices_graphql(depart_date: str, return_date: str) -> dict:
           origin: "%s"
           destination: "%s"
           depart_months: "%s"
-          return_dates: "%s"
         }
         paging: { limit: 50 offset: 0 }
         sorting: VALUE_ASC
@@ -250,10 +249,10 @@ def get_prices_graphql(depart_date: str, return_date: str) -> dict:
         ticket_link
       }
     }
-    """ % (ORIGIN, DESTINATION, depart_date, return_date)
+    """ % (ORIGIN, DESTINATION, out_from)
 
     headers = {
-        "Content-Type":  "application/json",
+        "Content-Type":   "application/json",
         "X-Access-Token": TRAVELPAYOUTS_TOKEN,
     }
 
@@ -273,24 +272,30 @@ def get_prices_graphql(depart_date: str, return_date: str) -> dict:
 
         result = {}
         for ticket in tickets:
-            # Фильтруем только по нужной дате вылета
-            dep = ticket.get("departure_at", "")[:10]
-            ret = ticket.get("return_at", "")[:10]
-            if dep != depart_date or ret != return_date:
+            dep     = ticket.get("departure_at", "")[:10]
+            ret     = ticket.get("return_at", "")[:10]
+            price   = ticket.get("value", 0)
+            link    = ticket.get("ticket_link", "")
+            airline = extract_airline(link)
+
+            # Фильтруем по нужным диапазонам дат
+            if not (out_from <= dep <= out_to):
+                continue
+            if not (ret_from <= ret <= ret_to):
+                continue
+            if not airline or not price:
                 continue
 
-            price      = ticket.get("value", 0)
-            link       = ticket.get("ticket_link", "")
-            airline    = extract_airline(link)
-
-            if airline and price:
-                if airline not in result or price < result[airline]:
-                    result[airline] = price
+            key = f"{dep}_{ret}"
+            if key not in result:
+                result[key] = {}
+            if airline not in result[key] or price < result[key][airline]:
+                result[key][airline] = price
 
         return result
 
     except Exception as e:
-        print(f"  [ОШИБКА] GraphQL {depart_date}/{return_date}: {e}")
+        print(f"  [ОШИБКА] GraphQL: {e}")
         return {}
 
 
@@ -345,54 +350,66 @@ def main():
     save_subscribers(subscribers)
     print(f"Подписчиков: {len(subscribers)}")
 
-    # 2. Собираем уникальные пары дат
+    # 2. Запрашиваем цены — один запрос на уникальный диапазон дат
     previous = load_previous_prices()
     current  = {}
-    pairs_to_subs: dict[str, list] = {}
 
+    # Собираем уникальные диапазоны дат по подписчикам
+    # (у двух людей могут быть одинаковые диапазоны — запрашиваем один раз)
+    unique_ranges = {}
     for chat_id, s in subscribers.items():
-        for out_date in date_range(s["out_from"], s["out_to"]):
-            for ret_date in date_range(s["ret_from"], s["ret_to"]):
-                key = f"{out_date}_{ret_date}"
-                pairs_to_subs.setdefault(key, []).append(chat_id)
-
-    print(f"Уникальных пар дат: {len(pairs_to_subs)}")
+        range_key = f"{s['out_from']}_{s['out_to']}_{s['ret_from']}_{s['ret_to']}"
+        if range_key not in unique_ranges:
+            unique_ranges[range_key] = {
+                "out_from": s["out_from"], "out_to": s["out_to"],
+                "ret_from": s["ret_from"], "ret_to": s["ret_to"],
+                "subs": []
+            }
+        unique_ranges[range_key]["subs"].append(chat_id)
 
     subscriber_alerts: dict[str, list] = {cid: [] for cid in subscribers}
 
-    for key, sub_ids in pairs_to_subs.items():
-        out_date, ret_date = key.split("_")
-        prices_by_airline = get_prices_graphql(out_date, ret_date)
+    for range_key, rng in unique_ranges.items():
+        print(f"Запрос: {rng['out_from']}–{rng['out_to']} / {rng['ret_from']}–{rng['ret_to']}")
+        all_prices = get_all_prices_graphql(
+            rng["out_from"], rng["out_to"],
+            rng["ret_from"], rng["ret_to"]
+        )
 
-        if not prices_by_airline:
-            print(f"  {key}: нет данных")
+        if not all_prices:
+            print("  Нет данных от API.")
             continue
 
-        current[key] = prices_by_airline
-        cheapest = min(prices_by_airline.values())
-        airlines_str = ", ".join(
-            f"{airline_name(k)}={v:,}₽"
-            for k, v in sorted(prices_by_airline.items(), key=lambda x: x[1])
-        )
-        print(f"  {key}: мин={cheapest:,}₽  [{airlines_str}]")
+        print(f"  Получено пар дат: {len(all_prices)}")
 
-        prev_prices = previous.get(key, {})
-        drops = []
-        for airline, new_price in prices_by_airline.items():
-            if airline in prev_prices:
-                old_price = prev_prices[airline]
-                if new_price < old_price:
-                    print(f"    ↓ {airline_name(airline)}: {old_price:,} → {new_price:,} ₽")
-                    drops.append({
-                        "airline":   airline,
-                        "old_price": old_price,
-                        "new_price": new_price,
-                    })
+        for key, prices_by_airline in all_prices.items():
+            out_date, ret_date = key.split("_")
+            current[key] = prices_by_airline
 
-        if drops:
-            alert_text = format_alert(out_date, ret_date, drops)
-            for cid in sub_ids:
-                subscriber_alerts[cid].append(alert_text)
+            cheapest = min(prices_by_airline.values())
+            airlines_str = ", ".join(
+                f"{airline_name(k)}={v:,}₽"
+                for k, v in sorted(prices_by_airline.items(), key=lambda x: x[1])
+            )
+            print(f"  {key}: мин={cheapest:,}₽  [{airlines_str}]")
+
+            prev_prices = previous.get(key, {})
+            drops = []
+            for airline, new_price in prices_by_airline.items():
+                if airline in prev_prices:
+                    old_price = prev_prices[airline]
+                    if new_price < old_price:
+                        print(f"    ↓ {airline_name(airline)}: {old_price:,} → {new_price:,} ₽")
+                        drops.append({
+                            "airline":   airline,
+                            "old_price": old_price,
+                            "new_price": new_price,
+                        })
+
+            if drops:
+                alert_text = format_alert(out_date, ret_date, drops)
+                for cid in rng["subs"]:
+                    subscriber_alerts[cid].append(alert_text)
 
     # 3. Рассылаем алерты
     for chat_id, alerts in subscriber_alerts.items():
