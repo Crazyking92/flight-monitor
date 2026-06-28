@@ -214,22 +214,20 @@ def send_message(chat_id: str, text: str):
 
 def get_prices_all_airlines(depart_date: str, return_date: str) -> dict:
     """
-    Запрашивает /v2/prices/latest — возвращает список билетов по направлению
-    с разбивкой по авиакомпаниям.
+    Запрашивает /v1/prices/cheap — возвращает минимальные цены по авиакомпаниям.
     Возвращает dict: {airline_code: price}
     """
-    url = "https://api.travelpayouts.com/v2/prices/latest"
+    url = "https://api.travelpayouts.com/v1/prices/cheap"
     params = {
-        "origin":        ORIGIN,
-        "destination":   DESTINATION,
-        "period_type":   "specific_date",
-        "depart_date":   depart_date,
-        "return_date":   return_date,
-        "currency":      "rub",
-        "token":         TRAVELPAYOUTS_TOKEN,
-        "sorting":       "price",
-        "limit":         30,
-        "one_way":       False,
+        "origin":             ORIGIN,
+        "destination":        DESTINATION,
+        "depart_date":        depart_date,
+        "return_date":        return_date,
+        "token":              TRAVELPAYOUTS_TOKEN,
+        "currency":           "rub",
+        "page":               1,
+        "limit":              30,
+        "show_to_affiliates": "false",
     }
     try:
         resp = requests.get(url, params=params, timeout=15)
@@ -239,11 +237,15 @@ def get_prices_all_airlines(depart_date: str, return_date: str) -> dict:
         if not data.get("success") or not data.get("data"):
             return {}
 
+        dest_data = data["data"].get(DESTINATION, {})
+        if not dest_data:
+            return {}
+
+        # Группируем по авиакомпании, берём минимальную цену
         result = {}
-        for ticket in data["data"]:
+        for ticket in dest_data.values():
             airline = ticket.get("airline", "")
-            price   = ticket.get("value", 0)
-            # Берём минимальную цену по каждой АК на эту пару дат
+            price   = ticket.get("price", 0)
             if airline and price:
                 if airline not in result or price < result[airline]:
                     result[airline] = price
