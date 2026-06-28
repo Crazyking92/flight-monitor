@@ -270,6 +270,14 @@ def get_all_prices_graphql(out_from: str, out_to: str, ret_from: str, ret_to: st
         data = resp.json()
 
         tickets = data.get("data", {}).get("prices_round_trip", []) or []
+        print(f"  [DEBUG] API вернул {len(tickets)} билетов")
+        if tickets:
+            # Показываем первые 3 для диагностики
+            for t in tickets[:3]:
+                dep = t.get("departure_at", "")[:10]
+                ret = t.get("return_at", "")[:10]
+                val = t.get("value", 0)
+                print(f"  [DEBUG] dep={dep} ret={ret} val={val}")
         if not tickets:
             return {}
 
